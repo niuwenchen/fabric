@@ -1,0 +1,187 @@
+msp
+    peer仅仅来自于标准的MSP文件  bccsp
+    const (
+    	FABRIC ProviderType = iota // MSP is of FABRIC type
+    	IDEMIX                     // MSP is of IDEMIX type
+    	OTHER                      // MSP is of OTHER TYPE
+
+    	// NOTE: as new types are added to this set,
+    	// the mspTypes map below must be extended
+    )
+
+    var mspTypeStrings = map[ProviderType]string{
+    	FABRIC: "bccsp",
+    	IDEMIX: "idemix",
+    }
+
+
+
+
+管理工具:
+    mgmt
+    aclmgmt  aclProvider
+    platforms: 是我们的运行平台 也就是环境 这里由node java golang  car
+    lscc: DeployedCCInfoProvider   部署链码信息提供者
+    ledgermgmt:
+        customtx.Initialize(initializer.CustomTxProcessors)
+        	cceventmgmt.Initialize(initializer.PlatformRegistry)
+        	finalStateListeners := addListenerForCCEventsHandler([]ledger.StateListener{})
+        	provider, err := kvledger.NewProvider()
+
+
+peer.CacheConfiguration();
+
+
+1 启动Server
+    serverConfig, err := peer.GetServerConfig()
+    peerServer, err := peer.NewPeerServer(listenAddr, serverConfig)
+        都是启动server  用的是server的一个函数 NewGRPCServerFromListener
+
+2 在peer端是进行需要进行deliver的操作，因此需要DeliverServer的实例
+    abServer := peer.NewDeliverEventsServer(mutualTLS, policyCheckerProvider, &peer.DeliverChainManager{})
+    pb.RegisterDeliverServer(peerServer.Server(), abServer)
+    将abServer这个service 注册到peerServer的sever grpc中， 函数功能以及在服务端完成了，在客户端只需要调用就行。
+3 启动Chaincode 服务
+    chaincodeSupport, ccp, sccp, packageProvider := startChaincodeServer(peerHost, aclProvider, pr)
+
+    // startChaincodeServer will finish chaincode related initialization, including:
+    // 1) setup local chaincode install path
+    // 2) create chaincode specific tls CA
+    // 3) start the chaincode specific gRPC listening service
+
+    (1) 安装地址
+    /opt/go/src/github.com/hyperledger/fabric/peer/demo/peer/production/chaincodes  我们自己设置的
+    ccprovider.SetChaincodesPath(chaincodeInstallPath)  第一步是设置local chaincode的安装地址
+
+    (2) 创建CA  证书认证
+    ca, err := tlsgen.NewCA()
+    c.caCert, err = newCertKeyPair(true, false, "", nil, nil)
+
+    (3) createChaincodeServer  创建属于chaincode的服务  srv, err = comm.NewGRPCServer(cclistenAddress, config)
+    这边只是创建  没有服务注册到这个server
+    registerChaincodeSupport  应该是这个方法注册 但是注释中说 //The chaincode support will come up without registering system chaincodes
+                                               //which will be registered only during join phase.
+                                          链码支持不需要注册系统链码，系统链码只在连接阶段注册。
+                                          可能没有注册这一步
+        ipRegistry := inproccontroller.NewRegistry()  // 这块就是ipc的启动和注册
+        sccp := scc.NewProvider(peer.Default, peer.DefaultSupport, ipRegistry)
+        lsccInst := lscc.New(sccp, aclProvider, pr)
+        chaincodeSupport := chaincode.NewChaincodeSupport(    链码支持服务端
+        		chaincode.GlobalConfig(),
+        		ccEndpoint,
+        		userRunsCC,
+        		ca.CertBytes(),
+        		authenticator,
+        		packageProvider,
+        		lsccInst,
+        		aclProvider,
+        		container.NewVMController(map[string]container.VMProvider{
+        			dockercontroller.ContainerType: dockercontroller.NewProvider(
+        				viper.GetString("peer.id"),
+        				viper.GetString("peer.networkId"),
+        			),
+        			inproccontroller.ContainerType: ipRegistry,
+        		}),
+        		sccp,
+        		pr,
+        		peer.DefaultSupport,
+        	)
+
+
+
+        chaincode_shim.pb.go
+        // Server API for ChaincodeSupport service
+        ccSrv := pb.ChaincodeSupportServer(chaincodeSupport)
+        	if tlsEnabled {
+        		ccSrv = authenticator.Wrap(ccSrv)
+        	}
+
+        	csccInst := cscc.New(ccp, sccp, aclProvider)
+        	qsccInst := qscc.New(aclProvider)
+
+        	//Now that chaincode is initialized, register all system chaincodes.
+        	sccs := scc.CreatePluginSysCCs(sccp)
+        	for _, cc := range append([]scc.SelfDescribingSysCC{lsccInst, csccInst, qsccInst, lifecycleSCC}, sccs...) {
+        		sccp.RegisterSysCC(cc)
+        	}
+        	pb.RegisterChaincodeSupportServer(grpcServer.Server(), ccSrv)
+
+        	return chaincodeSupport, ccp, sccp
+
+       启动chaincodeSupportServer 就是将各种系统链码启动的过程
+
+ 开始注册链码  for _, cc := range append([]scc.SelfDescribingSysCC{lsccInst, csccInst, qsccInst, lifecycleSCC}, sccs...) {
+         		sccp.RegisterSysCC(cc)
+         	}
+
+lsccInst := lscc.New(sccp, aclProvider, pr)
+    //The life cycle system chaincode manages chaincodes deployed
+    //on this peer. It manages chaincodes via Invoke proposals.
+    //     "Args":["deploy",<ChaincodeDeploymentSpec>]
+    //     "Args":["upgrade",<ChaincodeDeploymentSpec>]
+    //     "Args":["stop",<ChaincodeInvocationSpec>]
+    //     "Args":["start",<ChaincodeInvocationSpec>]
+    这个lscc看起来更像是local模式 里面定义了FileSystemSupport模式，适合本地存储相关的一系列方法
+    定义了 LifeCycleSysCC
+
+    func New(sccp sysccprovider.SystemChaincodeProvider, ACLProvider aclmgmt.ACLProvider, platformRegistry *platforms.Registry) *LifeCycleSysCC {
+    	return &LifeCycleSysCC{
+    		Support:          &supportImpl{},
+    		PolicyChecker:    policyprovider.GetPolicyChecker(),
+    		SCCProvider:      sccp,
+    		ACLProvider:      ACLProvider,
+    		PlatformRegistry: platformRegistry,
+    	}
+    }
+    返回的是LifeCycleSysCc
+    sccp := scc.NewProvider(peer.Default, peer.DefaultSupport, ipRegistry) // registry
+    sccp.RegisterSysCC()  scc.NewProvider 是一个系统链码的注册目标
+    // registerSysCC registers the given system chaincode with the peer
+    注册:
+    ccid := &ccintf.CCID{
+    		Name:    syscc.Name(),
+    		Version: version,
+    	}
+    	err := p.Registrar.Register(ccid, syscc.Chaincode())
+    将ccid注册到inproccontroller中
+
+    最后一个lifecycle
+    type SCC struct{}
+
+    // Name returns "+lifecycle"
+    func (scc *SCC) Name() string {
+    	return "+lifecycle"
+    }
+
+
+接下来是AdminServer
+    adminserver启动
+
+Endorsement：
+    serverEndorser := endorser.NewEndorserServer(privDataDist, endorserSupport, pr)
+
+    注意这里有个疑惑点:
+    ccp.DeploySysCCs("", ccp)  部署链码
+
+        println("难道在这里执行？")
+    	resp, _, err := ccprov.ExecuteLegacyInit(txParams, cccid, chaincodeDeploymentSpec)
+    	println("难道已经执行完成了？")
+    	if err == nil && resp.Status != shim.OK {
+    		err = errors.New(resp.Message)
+    	}
+    	上面的ccprov 是ccprovider.ChaincodeProvider 中的实例
+
+    chaincode_support 中的 ExecuteLegacyInit-->LaunchInit
+    --> runtime_launcher: Launch
+    --> container_launcher: Start -->  c.Processor.Process()  参数 scr := container.StartContainerReq{ 应该是启动vmController的请求命令
+    --> controller : Process
+    --> controller : Do
+    --> inptoccontroller: Start
+    --> chaincode : StartInProc
+
+    系统链码部署完成
+
+
+
+
+
